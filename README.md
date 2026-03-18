@@ -321,17 +321,6 @@ pytest tests/ -v --cov=src               # With coverage report
 
 ---
 
-## 📈 Resume Bullet Points
-
-- **Built end-to-end ML pipeline** on AWS classifying **39,110 real product images** into 5 categories with **98.39% test accuracy** and **0.9778 macro F1** using transfer learning (ResNet18)
-- **Trained on 31,286 images** with augmentation pipeline, achieving consistent improvement from 79% → 98.4% across 15 epochs; **footwear category reached 99.84% F1** on held-out test set
-- **Architected serverless inference** using Lambda, API Gateway, and SageMaker with sub-second p99 latency and auto-scaling (1-5 instances)
-- **Reduced costs 60%** through spot training, endpoint auto-scaling, and serverless architecture (~$83/month)
-- **Implemented MLOps pipeline** using Step Functions + EventBridge for weekly retraining with accuracy-gated deployment (≥90% threshold)
-- **Designed monitoring** with CloudWatch dashboards, 5 alarms, SNS alerting, and Model Monitor for drift detection
-
----
-
 ## 📚 Documentation
 
 | Document | Description |
