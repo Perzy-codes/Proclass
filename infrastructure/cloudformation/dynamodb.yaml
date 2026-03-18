@@ -1,0 +1,74 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DynamoDB table for storing product classification predictions.
+  Standalone template for cases where only the database needs updating.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  TTLDays:
+    Type: Number
+    Default: 90
+    Description: Days before predictions auto-expire
+
+Resources:
+  PredictionsTable:
+    Type: AWS::DynamoDB::Table
+    # CONCEPT: DeletionPolicy
+    # 'Retain' means: if you delete the CloudFormation stack,
+    # the DynamoDB table is NOT deleted. This prevents accidental
+    # data loss. You'd have to manually delete the table.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'product-predictions-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      
+      KeySchema:
+        - AttributeName: product_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      
+      AttributeDefinitions:
+        - AttributeName: product_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+      
+      GlobalSecondaryIndexes:
+        - IndexName: category-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      
+      Tags:
+        - Key: Project
+          Value: product-classifier
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  TableName:
+    Value: !Ref PredictionsTable
+  TableArn:
+    Value: !GetAtt PredictionsTable.Arn
+  StreamArn:
+    Value: !GetAtt PredictionsTable.StreamArn

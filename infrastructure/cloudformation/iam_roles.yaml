@@ -1,0 +1,168 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IAM Roles and Policies for Product Image Classifier.
+  Follows least-privilege principle — each role gets only what it needs.
+
+  CONCEPT: Least Privilege
+  =========================
+  Every AWS service needs an IAM role that defines what it can do.
+  "Least privilege" means giving the MINIMUM permissions required.
+  
+  Why this matters:
+  - If Lambda is compromised, attacker can only write to S3 (not delete buckets)
+  - Limits blast radius of misconfiguration
+  - Required for compliance (SOC2, HIPAA, etc.)
+  - Shows security awareness to interviewers
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+
+Resources:
+  # ========================================================================
+  # SageMaker Execution Role
+  # ========================================================================
+  # Used by: Training jobs, Endpoints, Model Monitor
+  # Permissions: S3 read/write, CloudWatch logs, ECR pull
+  
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'SageMakerExecutionRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: S3DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::product-images-raw-${Environment}-*'
+                  - !Sub 'arn:aws:s3:::product-images-raw-${Environment}-*/*'
+                  - !Sub 'arn:aws:s3:::ml-model-artifacts-${Environment}-*'
+                  - !Sub 'arn:aws:s3:::ml-model-artifacts-${Environment}-*/*'
+
+  # ========================================================================
+  # Lambda Execution Role
+  # ========================================================================
+  # Used by: Classification Lambda, Data Preparation Lambda
+  # Permissions: S3 write (processed images), SageMaker invoke, DynamoDB write
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ProductClassifierLambdaRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ClassificationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3: Write processed images only
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::product-images-processed-${Environment}-*/*'
+              # SageMaker: Invoke endpoint only (not create/delete)
+              - Effect: Allow
+                Action:
+                  - sagemaker:InvokeEndpoint
+                Resource:
+                  - !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/product-classifier*'
+              # DynamoDB: Write predictions only
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/product-predictions-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/product-predictions-${Environment}/index/*'
+
+  # ========================================================================
+  # Step Functions Execution Role
+  # ========================================================================
+  # Used by: Retraining pipeline
+  # Permissions: Lambda invoke, SageMaker training, SNS publish
+  
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'RetrainingPipelineRole-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:data-preparation*'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:model-evaluation*'
+              - Effect: Allow
+                Action:
+                  - sagemaker:CreateTrainingJob
+                  - sagemaker:DescribeTrainingJob
+                  - sagemaker:CreateModel
+                  - sagemaker:UpdateEndpoint
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:ml-pipeline-alerts-${Environment}'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt SageMakerExecutionRole.Arn
+
+Outputs:
+  SageMakerRoleArn:
+    Description: SageMaker execution role ARN
+    Value: !GetAtt SageMakerExecutionRole.Arn
+    Export:
+      Name: !Sub '${Environment}-SageMakerRoleArn'
+  
+  LambdaRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${Environment}-LambdaRoleArn'
+  
+  StepFunctionsRoleArn:
+    Description: Step Functions execution role ARN
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${Environment}-StepFunctionsRoleArn'

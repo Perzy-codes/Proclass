@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Product Image Classifier - Infrastructure as Code
+  
+  This SAM template defines ALL AWS resources needed for the ML pipeline.
+  Deploy with: sam deploy --guided
+  
+  CONCEPT: Infrastructure as Code (IaC)
+  ======================================
+  Instead of clicking through the AWS Console to create resources,
+  we define everything in this YAML file. Benefits:
+  
+  1. Reproducible: Deploy the same stack to dev/staging/prod
+  2. Version controlled: Track changes in git (who changed what, when)
+  3. Reviewable: Code review infrastructure changes like code changes
+  4. Automated: CI/CD can deploy infrastructure automatically
+  5. Self-documenting: The template IS the documentation
+  
+  CONCEPT: AWS SAM (Serverless Application Model)
+  =================================================
+  SAM is a simplified version of CloudFormation for serverless apps.
+  It adds shorthand for Lambda, API Gateway, DynamoDB, etc.
+  
+  Example: AWS::Serverless::Function creates:
+  - The Lambda function
+  - An IAM role with permissions
+  - CloudWatch log group
+  - Event source mappings
+  All from ~20 lines instead of ~100 lines of raw CloudFormation.
+
+# ============================================================================
+# CONCEPT: Parameters
+# ============================================================================
+# Parameters let you customize the stack at deploy time.
+# Example: sam deploy --parameter-overrides Environment=prod
+# This avoids hardcoding values and lets you reuse the template
+# for different environments (dev, staging, prod).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+  
+  SageMakerEndpointName:
+    Type: String
+    Default: product-classifier
+    Description: Name of the SageMaker inference endpoint
+  
+  ModelArtifactBucket:
+    Type: String
+    Default: ml-model-artifacts
+    Description: S3 bucket for model artifacts
+
+# ============================================================================
+# CONCEPT: Globals
+# ============================================================================
+# Global settings applied to ALL functions in this template.
+# Reduces repetition — you don't need to set timeout and memory
+# on every single function.
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 1024
+    Runtime: python3.10
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        ENDPOINT_NAME: !Ref SageMakerEndpointName
+        TABLE_NAME: !Ref PredictionsTable
+        PROCESSED_BUCKET: !Ref ProcessedImagesBucket
+
+Resources:
+  # ========================================================================
+  # S3 BUCKETS
+  # ========================================================================
+  
+  # Raw product images (uploaded by users/systems)
+  RawImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'product-images-raw-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled  # Protect against accidental deletions
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToInfrequentAccess
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30  # Older images are accessed less
+          - Id: MoveToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90  # Archive very old images
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  
+  # Processed images (resized, normalized)
+  ProcessedImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'product-images-processed-${Environment}-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90  # Processed images are transient
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ========================================================================
+  # API GATEWAY
+  # ========================================================================
+  # CONCEPT: API Gateway
+  # API Gateway creates a public REST endpoint that clients call.
+  # It handles: routing, rate limiting, caching, CORS, authentication.
+  # Think of it as a "front door" that protects and manages access to Lambda.
+  
+  ProductClassifierAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type, Authorization, X-Api-Key'"
+      # CONCEPT: Throttling
+      # Rate limiting prevents:
+      # 1. Abuse (someone hammering your API)
+      # 2. Cost overruns (each request costs money)
+      # 3. Cascading failures (overloading downstream services)
+      Auth:
+        DefaultAuthorizer: NONE
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          ThrottlingRateLimit: 100   # Requests per second
+          ThrottlingBurstLimit: 200  # Maximum burst
+
+  # ========================================================================
+  # LAMBDA FUNCTIONS
+  # ========================================================================
+  
+  # Main classification function
+  ClassifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'product-classifier-${Environment}'
+      CodeUri: ../../src/preprocessing/
+      Handler: lambda_handler.lambda_handler
+      Description: Preprocesses images and invokes SageMaker for classification
+      MemorySize: 1024  # More memory = more CPU = faster image processing
+      Timeout: 30
+      # CONCEPT: Lambda Layers
+      # Instead of packaging PIL/Pillow with every function,
+      # we use a Layer that contains common dependencies.
+      # Layers are shared across functions and cached by Lambda.
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p310-Pillow:4'
+      Policies:
+        # CONCEPT: Least Privilege
+        # Each function gets ONLY the permissions it needs.
+        # ClassifyFunction needs: S3 write, SageMaker invoke, DynamoDB write
+        # It does NOT get: S3 delete, DynamoDB admin, SageMaker create/delete
+        - S3CrudPolicy:
+            BucketName: !Ref ProcessedImagesBucket
+        - Statement:
+            - Effect: Allow
+              Action: sagemaker:InvokeEndpoint
+              Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PredictionsTable
+      Events:
+        ClassifyAPI:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ProductClassifierAPI
+            Path: /classify
+            Method: post
+        HealthCheck:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ProductClassifierAPI
+            Path: /health
+            Method: get
+
+  # ========================================================================
+  # DYNAMODB
+  # ========================================================================
+  # CONCEPT: DynamoDB Table Design
+  # DynamoDB is schemaless — you only define the key attributes.
+  # Other attributes can vary per item (no ALTER TABLE needed!).
+  #
+  # Key design:
+  #   Partition Key (product_id): Distributes data across partitions
+  #   Sort Key (timestamp): Orders items within a partition
+  #
+  # This supports queries like:
+  #   "Get all predictions for product X" → Query by partition key
+  #   "Get latest prediction for product X" → Query + ScanIndexForward=False + Limit=1
+  
+  PredictionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'product-predictions-${Environment}'
+      BillingMode: PAY_PER_REQUEST  # Auto-scales, pay only for what you use
+      KeySchema:
+        - AttributeName: product_id
+          KeyType: HASH    # Partition key
+        - AttributeName: timestamp
+          KeyType: RANGE   # Sort key
+      AttributeDefinitions:
+        - AttributeName: product_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+      # CONCEPT: Global Secondary Index (GSI)
+      # A GSI lets you query by a different key.
+      # Without GSI: Can only query by product_id
+      # With GSI: Can also query by category ("show all electronics predictions")
+      GlobalSecondaryIndexes:
+        - IndexName: category-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL  # Include all attributes in the index
+      # CONCEPT: TTL (Time to Live)
+      # Automatically deletes items after a specified time.
+      # We set TTL to 90 days — old predictions aren't useful.
+      # This saves storage costs and keeps the table lean.
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      # CONCEPT: Point-in-Time Recovery
+      # Enables continuous backups. You can restore the table
+      # to any second in the last 35 days. Essential for production.
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES  # Enables DynamoDB Streams
+
+  # ========================================================================
+  # EVENTBRIDGE RULE (Scheduled Retraining)
+  # ========================================================================
+  # CONCEPT: EventBridge
+  # EventBridge is the event bus for AWS. It can trigger actions based on:
+  # - Schedules (cron expressions)
+  # - AWS events (EC2 state change, S3 upload, etc.)
+  # - Custom events from your applications
+  
+  WeeklyRetrainingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'weekly-model-retraining-${Environment}'
+      Description: Triggers model retraining every Sunday at 2 AM UTC
+      ScheduleExpression: 'cron(0 2 ? * SUN *)'
+      # CONCEPT: Cron Expression
+      # Format: cron(minutes hours day-of-month month day-of-week year)
+      # 'cron(0 2 ? * SUN *)' = At 02:00 UTC every Sunday
+      # ? = "no specific value" (can't specify both day-of-month AND day-of-week)
+      State: ENABLED
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+# CONCEPT: Stack Outputs
+# Outputs export values that other stacks or users might need.
+# Example: The API URL is needed by the frontend team.
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ProductClassifierAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/classify'
+  
+  PredictionsTableName:
+    Description: DynamoDB table name
+    Value: !Ref PredictionsTable
+  
+  ProcessedBucketName:
+    Description: S3 bucket for processed images
+    Value: !Ref ProcessedImagesBucket
+  
+  RawBucketName:
+    Description: S3 bucket for raw images
+    Value: !Ref RawImagesBucket

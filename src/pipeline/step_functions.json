@@ -1,0 +1,233 @@
+{
+  "Comment": "Product Classification Automated Retraining Pipeline. Runs weekly via EventBridge to keep the model fresh with new data.",
+  "StartAt": "PrepareData",
+  "States": {
+    "PrepareData": {
+      "Type": "Task",
+      "Comment": "Lambda function that: 1) Collects new labeled images from S3, 2) Splits into train/val/test (80/10/10), 3) Validates image integrity, 4) Returns dataset statistics",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "data-preparation",
+        "Payload": {
+          "action": "prepare",
+          "source_bucket": "product-images-raw",
+          "min_images_per_class": 100
+        }
+      },
+      "ResultPath": "$.dataPrep",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckDataQuality"
+    },
+
+    "CheckDataQuality": {
+      "Type": "Choice",
+      "Comment": "Verify we have enough data to train. If any class has fewer than min_images_per_class, skip retraining and notify.",
+      "Choices": [
+        {
+          "Variable": "$.dataPrep.Payload.sufficient_data",
+          "BooleanEquals": true,
+          "Next": "TrainModel"
+        }
+      ],
+      "Default": "NotifyInsufficientData"
+    },
+
+    "NotifyInsufficientData": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:ml-pipeline-alerts",
+        "Subject": "[ML Pipeline] Insufficient Training Data",
+        "Message.$": "States.Format('Retraining skipped. Dataset stats: {}', $.dataPrep.Payload.stats)"
+      },
+      "End": true
+    },
+
+    "TrainModel": {
+      "Type": "Task",
+      "Comment": "Launch SageMaker training job with the latest dataset. Uses spot instances to save ~70% on training costs.",
+      "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+      "Parameters": {
+        "TrainingJobName.$": "States.Format('product-classifier-{}', $$.Execution.StartTime)",
+        "RoleArn": "arn:aws:iam::123456789012:role/SageMakerExecutionRole",
+        "AlgorithmSpecification": {
+          "TrainingImage": "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.0.0-gpu-py310",
+          "TrainingInputMode": "File"
+        },
+        "HyperParameters": {
+          "epochs": "15",
+          "batch-size": "32",
+          "learning-rate": "0.001",
+          "weight-decay": "0.0001",
+          "dropout-rate": "0.5",
+          "patience": "5"
+        },
+        "InputDataConfig": [
+          {
+            "ChannelName": "train",
+            "DataSource": {
+              "S3DataSource": {
+                "S3DataType": "S3Prefix",
+                "S3Uri": "s3://product-images-raw/train/"
+              }
+            }
+          },
+          {
+            "ChannelName": "validation",
+            "DataSource": {
+              "S3DataSource": {
+                "S3DataType": "S3Prefix",
+                "S3Uri": "s3://product-images-raw/val/"
+              }
+            }
+          }
+        ],
+        "OutputDataConfig": {
+          "S3OutputPath": "s3://ml-model-artifacts/training-jobs/"
+        },
+        "ResourceConfig": {
+          "InstanceType": "ml.g4dn.xlarge",
+          "InstanceCount": 1,
+          "VolumeSizeInGB": 30
+        },
+        "StoppingCondition": {
+          "MaxRuntimeInSeconds": 7200
+        },
+        "EnableManagedSpotTraining": true,
+        "MaxWaitTimeInSeconds": 14400
+      },
+      "ResultPath": "$.training",
+      "Retry": [
+        {
+          "ErrorEquals": ["SageMaker.AmazonSageMakerException"],
+          "IntervalSeconds": 120,
+          "MaxAttempts": 1,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "EvaluateModel"
+    },
+
+    "EvaluateModel": {
+      "Type": "Task",
+      "Comment": "Lambda function that: 1) Loads the newly trained model, 2) Runs evaluation on held-out test set, 3) Computes accuracy, precision, recall, F1, 4) Returns metrics for deployment decision",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "model-evaluation",
+        "Payload": {
+          "model_artifact.$": "$.training.ModelArtifacts.S3ModelArtifacts",
+          "test_data_uri": "s3://product-images-raw/test/"
+        }
+      },
+      "ResultPath": "$.evaluation",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "NotifyFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "CheckAccuracy"
+    },
+
+    "CheckAccuracy": {
+      "Type": "Choice",
+      "Comment": "Gate deployment on model quality. Only deploy if accuracy >= 90% AND the new model is better than the current production model.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.evaluation.Payload.accuracy",
+              "NumericGreaterThanEquals": 90.0
+            },
+            {
+              "Variable": "$.evaluation.Payload.is_improvement",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "DeployModel"
+        }
+      ],
+      "Default": "NotifyBelowThreshold"
+    },
+
+    "NotifyBelowThreshold": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:ml-pipeline-alerts",
+        "Subject": "[ML Pipeline] Model Below Quality Threshold",
+        "Message.$": "States.Format('New model accuracy: {}%. Current threshold: 90%. Model not deployed.', $.evaluation.Payload.accuracy)"
+      },
+      "End": true
+    },
+
+    "DeployModel": {
+      "Type": "Task",
+      "Comment": "Update the SageMaker endpoint with the new model. SageMaker performs a blue/green deployment — traffic gradually shifts to the new model with automatic rollback if errors spike.",
+      "Resource": "arn:aws:states:::sagemaker:createModel",
+      "Parameters": {
+        "ModelName.$": "States.Format('product-classifier-{}', $$.Execution.StartTime)",
+        "PrimaryContainer": {
+          "Image": "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.0.0-cpu-py310",
+          "ModelDataUrl.$": "$.training.ModelArtifacts.S3ModelArtifacts"
+        },
+        "ExecutionRoleArn": "arn:aws:iam::123456789012:role/SageMakerExecutionRole"
+      },
+      "ResultPath": "$.deployment",
+      "Next": "NotifySuccess"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:ml-pipeline-alerts",
+        "Subject": "[ML Pipeline] New Model Deployed Successfully",
+        "Message.$": "States.Format('New model deployed with {}% accuracy. Previous accuracy: {}%.', $.evaluation.Payload.accuracy, $.evaluation.Payload.previous_accuracy)"
+      },
+      "End": true
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Comment": "Catch-all error handler. Sends detailed error info for debugging.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:123456789012:ml-pipeline-alerts",
+        "Subject": "[ML Pipeline] Pipeline Failure - Action Required",
+        "Message.$": "States.Format('Pipeline failed. Error: {}', $.error)"
+      },
+      "End": true
+    }
+  }
+}

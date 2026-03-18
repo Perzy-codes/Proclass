@@ -1,0 +1,69 @@
+# ============================================================================
+# Training Configuration
+# ============================================================================
+# All hyperparameters and training settings in one place.
+# Change these values to experiment — no code changes needed.
+#
+# CONCEPT: Configuration Management
+# Separating config from code is a best practice because:
+# 1. Experiment tracking: Log which config produced which results
+# 2. Reproducibility: Re-run any experiment by loading its config
+# 3. Environment flexibility: Different configs for dev/staging/prod
+# 4. No code changes: Tune hyperparameters without touching code
+
+model:
+  architecture: resnet18        # Options: resnet18, resnet34, resnet50
+  num_classes: 5
+  pretrained: true              # Use ImageNet pre-trained weights
+  freeze_layers: 6              # Number of parameter groups to freeze
+  dropout_rate: 0.5             # Dropout probability (0.0 = no dropout)
+
+training:
+  epochs: 15
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.0001          # L2 regularization strength
+  patience: 5                   # Early stopping patience (epochs)
+  num_workers: 4                # DataLoader parallel workers
+  
+  # Learning rate scheduler
+  scheduler:
+    type: cosine_annealing       # Options: cosine_annealing, step, plateau
+    min_lr_ratio: 0.01           # Minimum LR = learning_rate * min_lr_ratio
+
+data:
+  input_size: 224
+  categories:
+    - apparel
+    - footwear
+    - accessories
+    - bottomwear
+    - personal_care
+  
+  # Data augmentation settings
+  augmentation:
+    random_horizontal_flip: 0.5
+    random_rotation: 15          # degrees
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.2
+      hue: 0.1
+    random_resized_crop_scale: [0.08, 1.0]
+
+# SageMaker training job settings
+sagemaker:
+  training_instance: ml.g4dn.xlarge    # GPU instance for training
+  inference_instance: ml.m5.large      # CPU instance for inference (cheaper)
+  spot_training: true                   # Use spot instances (save ~70%)
+  max_runtime_seconds: 7200             # 2 hour timeout
+  volume_size_gb: 30                    # EBS volume for training data
+
+# S3 paths
+s3:
+  raw_bucket: product-images-raw
+  processed_bucket: product-images-processed
+  model_artifacts_bucket: ml-model-artifacts
+  train_prefix: train/
+  val_prefix: val/
+  test_prefix: test/

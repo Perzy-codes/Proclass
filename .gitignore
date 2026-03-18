@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables (NEVER commit secrets!)
+.env
+.env.local
+.env.production
+
+# ML artifacts (too large for git)
+model/
+*.pth
+*.pt
+*.onnx
+model.tar.gz
+
+# Data (too large for git, stored in S3)
+data/train/
+data/val/
+data/test/
+*.jpg
+*.jpeg
+*.png
+!data/sample/*.jpg
+
+# AWS
+.aws/
+samconfig.toml
+
+# Testing
+.pytest_cache/
+htmlcov/
+.coverage
+coverage.xml
+
+# Misc
+.DS_Store
+Thumbs.db
+*.log
+.mypy_cache/
